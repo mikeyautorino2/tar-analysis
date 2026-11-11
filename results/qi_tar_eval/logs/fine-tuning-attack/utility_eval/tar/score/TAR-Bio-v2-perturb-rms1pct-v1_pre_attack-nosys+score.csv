@@ -1,0 +1,2 @@
+model,bench,metric,score
+TAR-Bio-v2-perturb-rms1pct-v1_pre_attack-nosys,mmlu,accuracy,27.1994

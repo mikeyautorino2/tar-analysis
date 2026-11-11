@@ -1,0 +1,4 @@
+model,bench,evaluator,score
+TAR-Bio-v2-perturb-rms1pct-v1_pre_attack-nosys,wmdp_bio,wmdp,24.0377
+TAR-Bio-v2-perturb-rms1pct-v1_pre_attack-nosys,wmdp_chem,wmdp,26.4706
+TAR-Bio-v2-perturb-rms1pct-v1_pre_attack-nosys,wmdp_cyber,wmdp,24.5596
