@@ -1,2 +1,8 @@
 *.env*
 *__pycache__*
+# Local / generated (not part of the repo)
+/wandb/
+/logs/
+core.*
+results/**/raw/
+results/qi_tar_eval/slurm_logs/

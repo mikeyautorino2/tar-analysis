@@ -1,127 +1,119 @@
-# [ICLR 2025] Official Repository for "Tamper-Resistant Safeguards for Open-Weight LLMs"
-<p>
-    <a href="https://www.python.org/">
-        <img alt="Build" src="https://img.shields.io/badge/Python-3.7+-1f425f.svg?color=purple">
-    </a>
-    <a href="https://copyright.illinois.edu/">
-        <img alt="License" src="https://img.shields.io/badge/License-MIT-blue">
-    </a>
-</p>
+# tar-analysis
 
-by [Rishub Tamirisa](https://rishub-tamirisa.github.io/research/)<sup>\*</sup>, [Bhrugu Bharathi](https://www.linkedin.com/in/bhrugu-bharathi/)<sup>\*</sup>, [Long Phan](https://longphan.ai/), [Andy Zhou](https://www.andyzhou.ai/), [Alice Gatti](https://www.linkedin.com/in/gattialice/), [Tarun Suresh](https://www.linkedin.com/in/tarsur909/), [Maxwell Lin](https://www.linkedin.com/in/maxwell-l-05402819b/), [Justin Wang](https://www.justinwang.xyz/), [Rowan Wang](https://rowankwang.com/), [Ron Arel](https://arel.ai/), [Andy Zou](https://andyzoujm.github.io/), [Dawn Song](https://dawnsong.io/), [Bo Li](https://aisecure.github.io/), [Dan Hendrycks](https://hendrycks.github.io/), and [Mantas Mazeika](https://www.linkedin.com/in/mmazeika/)
+Experiments on **TAR (Tamper-Resistant Safeguards for open-weight LLMs)** for the biosecurity
+domain:
+- changes to how TAR's simulated fine-tuning attacks are sampled during training;
+- analyses of where TAR changes the weights;
+- red-teaming the resulting models with the attacks from Qi et al. (2024).
 
-See our [project page](https://www.tamper-resistant-safeguards.com/) and [paper on ArXiv](https://arxiv.org/abs/2408.00761).
+This repository is built on the official TAR code by Tamirisa et al.
+([rishub-tamirisa/tamper-resistance](https://github.com/rishub-tamirisa/tamper-resistance)). The
+original README is kept in [`docs/TAR_README.md`](docs/TAR_README.md); please cite the TAR paper
+([`CITATION.bib`](CITATION.bib)) if you use this code.
 
-We introduce a novel method, Tampering Attack Resistance (TAR), which is the first defense to withstand a significant number of open-weight fine-tuning attacks on LLMs, while preserving model capabilities.
+## Research questions
 
-## Table of Contents
+1. **Diverse attack sampling.** Does sampling TAR's training-time attacks from a wider range of
+   optimizer settings (learning rate, schedule, warmup) improve tamper resistance?
+2. **Random weight perturbation.** Does training TAR against attacks that start from randomly
+   perturbed weights (θ + ε, with ε ~ N(0, (0.01·rms(W))²) per tensor) improve tamper resistance?
+3. **Where does TAR act?** Which layers and modules does TAR change, and which ones do attacks move?
 
-- [📰 Updates 📰](#-updates-)
-- [🛡️ What are Tamper-Resistant Safeguards? 🛡️](#️-what-are-tamper-resistant-safeguards-️)
-- [🌐 Overview 🌐](#-overview-)
-- [☕ Quick Start ☕](#-quick-start-)
-  - [📦 Setup](#-setup)
-  - [🛠️ Running Tamper-Resistance Training](#️-running-tamper-resistance-training)
-  - [➕ Running the Red-teaming evaluation](#-running-the-red-teaming-evaluation)
-- [📁 Directory Structure](#-directory-structure)
-- [🤗 Models and Datasets](#-models-and-datasets)
-- [🙏 Citation 🙏](#citation)
+## Results
 
-## 📰 Updates 📰
-* ***[2024/10/14] TAR-Bio-v2**: We identified a data contamination issue in our instruction-following retain dataset; we've resolved the issue and trained a new model: [🤗 
-Llama-3-8B-Instruct-TAR-Bio-v2](https://huggingface.co/lapisrocks/Llama-3-8B-Instruct-TAR-Bio-v2). Please use this model for evaluations, thanks!* 
-* ***[2024/08/07] TAR Release**: Initial code release, including red-teaming evaluation + baseline implementations, and [🤗 Huggingface models](https://huggingface.co/collections/lapisrocks/tamper-resistant-safeguards-for-open-weight-llms-66b2dc4cc40442c79ec890a5)!* 
+### Red-teaming with Qi et al.'s TAR attacks
 
-## 🛡️ What are Tamper-Resistant Safeguards? 🛡️
+Full results, settings and per-seed scores are in [`results/qi_tar_eval/`](results/qi_tar_eval/).
 
-Tamper-Resistant Safeguards are security measures designed for open-weight large language models (LLMs) to protect against malicious modifications of the model's weights. Unlike traditional safeguards that focus on preventing input-based attacks, these advanced safeguards prevent adversaries with access to full model weights from recovering performance on harmful capabilities. We demonstrate in our extensive red-teaming evaluation that Tamper-Resistant Safeguards created via TAR are the first to be robust to a significant number of open-weight fine-tuning attacks.
+All values are **accuracy in %** on 4-choice tests, so 25% is chance.
+- **WMDP** measures hazardous knowledge: **lower is safer**, and about 25% means none.
+- **MMLU** measures general capability: **higher is better**.
+- The attacks fine-tune on Pile-Bio retain text for 1000 steps, with 5 seeds each. **Worst** is the
+  maximum over the seeds.
 
-## 🌐 Overview 🌐
+| Model | Before attack: WMDP-bio ↓ | Before attack: MMLU ↑ | Full-param attack: WMDP-bio ↓ (worst / mean) | LoRA attack: WMDP-bio ↓ (worst / mean) |
+|---|---|---|---|---|
+| TAR-Bio-v2 (official) | 28.1 | 55.1 | 60.4 / 58.4 | 38.6 / 37.1 |
+| **Diverse-params v1** (this repo) | 25.0 | 49.3 | **47.7 / 45.2** | **30.8 / 30.2** |
+| Perturb-rms1pct v1 (this repo) | 24.0 | 27.2 | 52.7 / 50.3 | 25.5 / 25.3 |
 
-This repository contains implementations for TAR (including the Random Mapping initial safeguard), the red-teaming evaluation used in the paper, and baseline methods.
+For reference, the original Llama-3-8B-Instruct scores about 71% on WMDP-bio under this
+evaluation.
 
+- **The official TAR-Bio-v2 reproduces Qi et al.** Its pre-attack WMDP-bio is 28.1, as in their
+  Table 7, and the full-param attack recovers it to about 60%.
+- **Diverse attack sampling is the most robust usable model.** Its worst-case WMDP-bio after the
+  full-param attack is 12.7 points lower than the official model's, and below the official
+  model's on every seed. The cost is about 6 points of MMLU. Its training setup also differs from
+  the official run in more than the sampling, so not all of the gap can be attributed to it.
+- **The weight perturbation model collapsed.** Before any attack it answers "D" to every WMDP and
+  MMLU question (MMLU at chance). The full-param attack restores WMDP-chem and WMDP-cyber to normal
+  levels as well as bio, so the knowledge was not removed. This is a negative result: noise at
+  1% of each tensor's RMS before every attack made TAR degrade the whole model instead of
+  selectively removing bio knowledge.
 
-## ☕ Quick Start ☕
+### Weight analyses
+- [`results/weight_diff/`](results/weight_diff/): per-layer and per-module ‖Δθ‖ between
+  TAR-Bio-v2 and Llama-3-8B-Instruct. The change is spread across all layers (2.4–4% relative),
+  rises in the last ~10 layers, and is largest in `lm_head` (13.8%) and in the attention `v_proj` and
+  `o_proj`.
+- [`results/loss_interpolation/`](results/loss_interpolation/): 1-D loss along
+  θ(α) = (1−α)·θ_official + α·θ_perturbed, on bio (forget) and benign (retain) Pile-Bio text.
+  *Preliminary:* the absolute losses at the endpoints are very high (e.g. 8.1 nats/token on benign
+  text for the official model) and have not yet been cross-checked against an independent
+  evaluation.
+- With `--track_attack_displacement`, training logs how far each layer moves during every
+  simulated attack. The CSV and plots for the perturbation run are published with that model on
+  Hugging Face.
 
-### 📦 Setup
+## Models (Hugging Face)
+- [`mikeyautorino2/Llama-3-8B-Instruct-TAR-Bio-diverse-params-v1`](https://huggingface.co/mikeyautorino2/Llama-3-8B-Instruct-TAR-Bio-diverse-params-v1)
+- [`mikeyautorino2/Llama-3-8B-Instruct-TAR-Bio-v2-perturb-rms1pct-v1`](https://huggingface.co/mikeyautorino2/Llama-3-8B-Instruct-TAR-Bio-v2-perturb-rms1pct-v1)
 
-1.  Clone and enter the repository:
-    ```bash
-    git clone https://github.com/rishub-tamirisa/tamper-resistance.git
-    cd tamper-resistance
-    ```
+Model cards: [`model_cards/`](model_cards/).
 
-2. Install dependencies:
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-3. Setup the dotenv (`.env`):
-    - In the root level of the repository, create a `.env` file following the format of the included `dotenv` file.
-    - We've already included the FSDP configs used for running the method in the `configs` folder. You can use these or create your own. For running TAR with FSDP v1, it's important that `fsdp_use_orig_params=false` and `fsdp_sharding_strategy=1`.
-    - Finally, set the environment variables:
-      ```bash
-      source .env
-      ```
-
-
-> [!CAUTION]
-> Do not push your `.env` file to a public repository. Since it contains your Huggingface token and other secrets, it could lead to unauthorized access to your Huggingface account. We've already included it in the `.gitignore` file to prevent this.
-  
-
-### 📁 Directory Structure
-
-`tar.py` serves as the main entrypoint for running the TAR method. It uses python modules in the `modules` folder. Example usage is provided in the `run_tar_bio.sh` and `run_tar_cyber.sh` scripts.
-
-The `modules` folder contains the following files:
-- `baselines.py`: Entrypoint for running baseline methods
-- `dataloaders.py`: Dataloader implementations
-- `objectives.py`: Objective / loss function implementations
-- `fsdp_v1_utils.py`: Utilities for FSDP v1
-- `training.py`: All training loop implementations, including TAR
-- `utils.py`: Helper functions
-
-The `red_teaming` folder contains implementations for running all fine-tuning attacks discussed in the paper, as well as an FSDP-supported MMLU evaluation script.
-
-### 🛠️ Running Tamper-Resistance Training
-
-> [!NOTE]  
-> The current implementation assumes that models come from 🤗 Transformers, meaning they have the expected configs, subclasses, etc. However, the FSDP wrapping can be made compatible with any model. We plan to update the code to be more agnostic when we migrate to FSDP v2. (This repository also serves as a scalable first-order meta-learning implementation)
-
-We provide scripts in the root-level folder for running TAR for biosecurity and cybersecurity: `run_tar_bio.sh` and `run_tar_cyber.sh`.
-
-It's recommended to run Llama-3-8B-Instruct models (or similar size) on systems with `8xA100 80G` or more VRAM due to full-parameter training and other overheads introduced by the first-order meta-learning implementation. 
-
-Note: the code is currently untested on multi-node environments, we expect to support this upon migration to the [recently released `FSDP2` from PyTorch 2.4](https://pytorch.org/blog/pytorch2-4/#prototype-fsdp2-dtensor-based-per-parameter-sharding-fsdp).
-
-With the appropriate GPU setup, and assuming the `.env` is correctly set, simply run:
-
-```bash
-sh run_tar_bio.sh
-```
-
-### ➕ Running the Red-teaming evaluation
-
-In the `red_teaming` folder, `red_teaming_evaluation.py` serves as the entrypoint for running the red-teaming evaluations from the paper. Most methods use full-parameter training, so scripts should be launched with `accelerate` similar to the setup in the `run_tar_bio.sh` and `run_tar_cyber.sh` scripts.
-
-Check out the `README` documentation in the `red_teaming` folder for full details, as well as the documentation in `red_teaming/mmlu_eval` for specific details on running the full evaluation. 
-
-## 🤗 Models and Datasets
-
-We release models and datasets here: [🤗 Huggingface Collection](https://huggingface.co/collections/lapisrocks/tamper-resistant-safeguards-for-open-weight-llms-66b2dc4cc40442c79ec890a5).
-
-## Citation
-
-If you find this repository useful in your research, please consider citing our paper:
+## Repository layout
 
 ```
-@misc{tamirisa2024tamperresistantsafeguardsopenweightllms,
-      title={Tamper-Resistant Safeguards for Open-Weight LLMs}, 
-      author={Rishub Tamirisa and Bhrugu Bharathi and Long Phan and Andy Zhou and Alice Gatti and Tarun Suresh and Maxwell Lin and Justin Wang and Rowan Wang and Ron Arel and Andy Zou and Dawn Song and Bo Li and Dan Hendrycks and Mantas Mazeika},
-      year={2024},
-      eprint={2408.00761},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2408.00761}, 
-}
+tar.py, modules/, configs/      TAR training code (upstream, with the changes in docs/CHANGES.md)
+  modules/layer_tracking.py     per-layer attack displacement + random weight perturbation (FSDP)
+scripts/train/                  training configs + Slurm jobs (1 node × 4 H100)
+  run_tar_bio.sh                diverse-params v1 config
+  run_tar_bio_perturb.sh        weight-perturbation config (repo default + --weight_perturb_scale 0.01)
+  run_tar_bio_1x4.sbatch        train → sharded save → merge → plots
+scripts/upload/                 convert to bf16 + upload a checkpoint to Hugging Face
+analysis/                       weight diff, attack-displacement plots, loss interpolation,
+                                perturbed-checkpoint generation
+evals/qi_tar/                   Expanse versions of Qi et al.'s TAR red-teaming scripts + summary
+results/                        evaluation and analysis results (summaries, CSVs, plots)
+model_cards/                    Hugging Face model cards
+docs/                           CHANGES.md (all changes vs. upstream TAR), TAR_README.md
+red_teaming/, extra/            upstream TAR red-teaming and probing code
 ```
+
+## Running
+
+The scripts were written for SDSC Expanse (Slurm, H100 nodes) and set the account, partition and
+paths for that cluster; adjust the `#SBATCH` lines for your own.
+
+1. **Environment:** Python 3.11 with `pip install -r requirements.txt`. The Qi evaluation needs
+   its own environment; see [`evals/qi_tar/`](evals/qi_tar/) and
+   [`results/qi_tar_eval/README.md`](results/qi_tar_eval/README.md).
+2. **Configuration:** copy [`dotenv`](dotenv) to `.env` and fill it in (Hugging Face token and
+   cache, `SAVE_MODELS_DIR`, accelerate config paths). `.env` is git-ignored.
+3. **Training** (from the repo root):
+   ```bash
+   sbatch scripts/train/run_tar_bio_1x4.sbatch                                                # diverse-params config
+   RUN_SCRIPT=scripts/train/run_tar_bio_perturb.sh sbatch scripts/train/run_tar_bio_1x4.sbatch  # perturbation config
+   sbatch scripts/train/run_tar_bio_1x4.sbatch --max_steps 3 --expname test                   # quick test
+   ```
+   Each job trains, saves a sharded checkpoint, merges it into `model.safetensors` and writes plots.
+4. **Analyses:** `sbatch analysis/weight_diff.sbatch`, `sbatch analysis/loss_interpolation.sbatch`,
+   `python analysis/plot_attack_displacement.py <run output dir>`.
+5. **Qi et al. evaluation:** clone
+   [Evaluating-Durable-Safeguards](https://github.com/princeton-polaris-lab/Evaluating-Durable-Safeguards),
+   copy `evals/qi_tar/*` into its `scripts/tar/`, and submit them as described in
+   [`results/qi_tar_eval/README.md`](results/qi_tar_eval/README.md).
+
+All changes relative to the upstream TAR code are documented in
+[`docs/CHANGES.md`](docs/CHANGES.md).
