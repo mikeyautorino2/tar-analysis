@@ -9,6 +9,7 @@ import schedulefree
 import torch
 import wandb
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
+from accelerate.utils import save_fsdp_model
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from transformers import (
     AutoModelForCausalLM,
@@ -60,7 +61,8 @@ def finetune_no_trainer(
 
     # Wandb logging
     if accelerator.is_main_process:
-        wandb_mode = "online" if args.wandb else "disabled"
+        # WANDB_MODE=offline logs locally (sync later with `wandb sync`)
+        wandb_mode = os.environ.get("WANDB_MODE", "online") if args.wandb else "disabled"
         wandb.login()
         wandb.init(
             project=args.wandb_project_name,
@@ -72,6 +74,13 @@ def finetune_no_trainer(
     accelerator.free_memory()
     tokenizer = AutoTokenizer.from_pretrained(tokenizer)
     tokenizer.pad_token = tokenizer.eos_token
+
+    # Recompute activations in backward to cut activation memory (lets TAR fit on one 4-GPU node)
+    if args.gradient_checkpointing:
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
     # prepare model before optimizer: https://huggingface.co/blog/pytorch-fsdp
     model = accelerator.prepare_model(model)
@@ -91,15 +100,22 @@ def finetune_no_trainer(
         dataloaders,
         optimizer,
         accelerator,
+        output_dir=output_dir,
         **vars(args),
     )
     accelerator.wait_for_everyone()
-    accelerator.unwrap_model(model).save_pretrained(
-        output_dir,
-        is_main_process=accelerator.is_main_process,
-        save_function=accelerator.save,
-        state_dict=accelerator.get_state_dict(model),
-    )
+    # Each rank writes its own shard (no full-model gather onto rank 0, which hung on 2 nodes).
+    # Merge afterwards with: accelerate merge-weights <output_dir>/pytorch_model_fsdp_0 <output_dir>
+    accelerator.print(f"Saving sharded checkpoint to {output_dir}")
+    accelerator.state.fsdp_plugin.set_state_dict_type("SHARDED_STATE_DICT")
+    save_fsdp_model(accelerator.state.fsdp_plugin, accelerator, model, output_dir)
+    if accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.config.save_pretrained(output_dir)
+        if unwrapped_model.generation_config is not None:
+            unwrapped_model.generation_config.save_pretrained(output_dir)
+    accelerator.wait_for_everyone()
+    accelerator.print("Sharded checkpoint saved")
 
 
 # Map the subject to the dataloader
@@ -185,6 +201,15 @@ def main():
     parser.add_argument(
         "--adversary_lr_samples", "-als", type=str, default="2e-6,2e-5,4e-5"
     )
+    # Optional adversary hyperparameter distributions ("value:weight,..."); unset keeps the fixed default
+    parser.add_argument("--adversary_optimizers", "-aopt", type=str, default=None)
+    parser.add_argument("--adversary_warmup_steps", "-aws", type=str, default=None)
+    parser.add_argument("--adversary_inner_loop_steps", "-ais", type=str, default=None)
+    parser.add_argument("--adversary_batch_sizes", "-abs", type=str, default=None)
+    parser.add_argument("--adversary_sgd_lr_samples", "-asls", type=str, default=None)
+    parser.add_argument("--gradient_checkpointing", "-gc", action="store_true")
+    parser.add_argument("--track_attack_displacement", "-tad", action="store_true")
+    parser.add_argument("--weight_perturb_scale", "-wps", type=float, default=0.0)
     parser.add_argument("--wandb", "-wb", action="store_true")
     parser.add_argument("--unbounded", "-ub", action="store_true")
     parser.add_argument("--retain_same_base", "-rsb", action="store_true")

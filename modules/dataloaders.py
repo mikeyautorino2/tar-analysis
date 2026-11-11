@@ -85,9 +85,10 @@ def get_bio_pilecamel_forget_with_heldout_dataloaders(tokenizer, accelerator, ar
         shuffle=True,
     )
 
+    # Only used as the adversary's retain data, so it shares the adversary micro-batch size
     pure_retain_dataloader = torch.utils.data.DataLoader(
         tokenized_retain_dataset.remove_columns(["concept_label"]),
-        batch_size=args.batch_size,
+        batch_size=args.tar_adversary_batch_size,
         collate_fn=data_collator,
         shuffle=True,
     )

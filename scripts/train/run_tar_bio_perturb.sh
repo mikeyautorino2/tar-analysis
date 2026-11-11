@@ -1,4 +1,4 @@
-accelerate launch --config_file $ExACCEL_CONFIG tar.py \
+accelerate launch --config_file $ExACCEL_CONFIG $ACCEL_LAUNCH_ARGS tar.py \
 --trainer_type tar_trainer \
 --max_steps 750 \
 --tar_num_tasks_sampled 1 \
@@ -14,7 +14,7 @@ accelerate launch --config_file $ExACCEL_CONFIG tar.py \
 --lr 2e-05 \
 --adversary_lr_samples 2e-6,2e-5,4e-5 \
 --batch_size 8 \
---gradient_accumulation_steps 1 \
+--gradient_accumulation_steps 2 \
 --adversary_dist_types pile-bio:0.33,camel-bio:0.33,retain_forget_switch:0.33 \
 --switching_point_coeffs alpha:6.0,beta:3.0 \
 --adversary_lr_schedulers constant:1.0 \
@@ -24,4 +24,10 @@ accelerate launch --config_file $ExACCEL_CONFIG tar.py \
 --base_model_name lapisrocks/Llama-3-8B-Instruct-Random-Mapped-Bio \
 --subject bio \
 --base llama3 \
---new_model_name Llama-3-8B-Instruct-TAR-Bio
+--gradient_checkpointing \
+--wandb \
+--track_attack_displacement \
+--weight_perturb_scale 0.01 \
+--new_model_name Llama-3-8B-Instruct-TAR-Bio-v2-perturb \
+--expname rms1pct_v1 \
+"$@"

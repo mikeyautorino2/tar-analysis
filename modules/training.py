@@ -1,3 +1,6 @@
+import csv
+import math
+import os
 import random
 from typing import List, Union
 
@@ -12,6 +15,12 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from modules.fsdp_v1_utils import FSDPModelStorage
+from modules.layer_tracking import (
+    ShardIndex,
+    attack_displacement,
+    per_block_summary,
+    perturb_weights,
+)
 from modules.objectives import (
     log_p_loss,
     dpo_loss_obj,
@@ -764,6 +773,7 @@ def inner_loop_step(
     sub_pbar: tqdm = None,
     tamper_resistance_loss_type: str = "max_entropy",
     compute_tamper_resistance_grad: bool = True,
+    adversary_accumulation_steps: int = None,
 ) -> float:
     """
     Perform a single inner loop step in the tamper-resistant training process.
@@ -785,6 +795,7 @@ def inner_loop_step(
         sub_pbar (tqdm, optional): Progress bar for sub-steps.
         tamper_resistance_loss_type (str, optional): Type of tamper resistance loss. Defaults to "ascent_grad".
         compute_tamper_resistance_grad (bool, optional): Whether to compute tamper resistance gradient. Defaults to True.
+        adversary_accumulation_steps (int, optional): Number of adversary micro-batches per adversary step. Defaults to gradient_accumulation_steps.
 
     Returns:
         float: The computed tamper resistance loss.
@@ -796,7 +807,8 @@ def inner_loop_step(
         adversary_batches=adversary_batches,
         accelerator=accelerator,
         sub_pbar=sub_pbar,
-        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_accumulation_steps=adversary_accumulation_steps
+        or gradient_accumulation_steps,
     )
     inner_optimizer.step()
     if inner_scheduler:
@@ -861,6 +873,80 @@ def _sample_switching_point(
     return M
 
 
+DISPLACEMENT_COLUMNS = [
+    "outer_step", "attack_idx", "adversary_type", "lr", "scheduler", "warmup_steps",
+    "block", "module", "numel", "l2_diff", "rel_diff",
+]
+
+
+def _adversary_lr_lambda(scheduler_type: str, warmup_steps: int, total_steps: int):
+    """
+    Build an LR multiplier for the adversary: linear warmup, then constant/linear/cosine decay.
+
+    Args:
+        scheduler_type (str): One of "constant", "linear", "cosine".
+        warmup_steps (int): Number of linear warmup steps (0 disables warmup).
+        total_steps (int): Total number of adversary steps.
+
+    Returns:
+        Callable[[int], float]: Multiplier for torch.optim.lr_scheduler.LambdaLR.
+    """
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        if scheduler_type == "linear":
+            return max(0.0, 1.0 - progress)
+        if scheduler_type == "cosine":
+            return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+        return 1.0
+
+    return lr_lambda
+
+
+def _sample_adversary_config(
+    adversary_optimizers: str,
+    adversary_warmup_steps: str,
+    adversary_inner_loop_steps: str,
+    adversary_batch_sizes: str,
+    tar_inner_loop_steps: int,
+    tar_adversary_batch_size: int,
+    gradient_accumulation_steps: int,
+) -> dict:
+    """
+    Sample the adversary's optimizer, warmup, number of steps, and batch size (shared across ranks).
+
+    Each argument uses the "value:weight,value:weight" format; None keeps the original fixed setting.
+    Batch sizes are per-GPU and must be multiples of tar_adversary_batch_size, since they are
+    realized by accumulating that many micro-batches per adversary step.
+    """
+    optimizer_type = distributed_sample_task(adversary_optimizers or "adamw:1.0")
+    warmup_steps = int(distributed_sample_task(adversary_warmup_steps or "0:1.0"))
+    inner_loop_steps = (
+        int(distributed_sample_task(adversary_inner_loop_steps))
+        if adversary_inner_loop_steps
+        else tar_inner_loop_steps
+    )
+    batch_size = (
+        int(distributed_sample_task(adversary_batch_sizes))
+        if adversary_batch_sizes
+        else tar_adversary_batch_size * gradient_accumulation_steps
+    )
+    if batch_size % tar_adversary_batch_size != 0:
+        raise ValueError(
+            f"Adversary batch size {batch_size} must be a multiple of "
+            f"--tar_adversary_batch_size {tar_adversary_batch_size}"
+        )
+    return {
+        "optimizer": optimizer_type,
+        "warmup_steps": warmup_steps,
+        "inner_loop_steps": inner_loop_steps,
+        "batch_size": batch_size,
+        "accumulation_steps": batch_size // tar_adversary_batch_size,
+    }
+
+
 def tar_training_loop(
     model: Union[AutoModelForCausalLM, FSDP],
     dataloaders: dict[str, torch.utils.data.DataLoader],
@@ -885,6 +971,15 @@ def tar_training_loop(
     retain_representations: bool = False,
     switching_point_coeffs: str = "alpha:6.0,beta:3.0",
     retain_model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",
+    adversary_optimizers: str = None,
+    adversary_warmup_steps: str = None,
+    adversary_inner_loop_steps: str = None,
+    adversary_batch_sizes: str = None,
+    tar_adversary_batch_size: int = 1,
+    adversary_sgd_lr_samples: str = None,
+    track_attack_displacement: bool = False,
+    weight_perturb_scale: float = 0.0,
+    output_dir: str = None,
     **kwargs,
 ):
     """
@@ -918,6 +1013,15 @@ def tar_training_loop(
         retain_representations (bool, optional): Whether to retain representations. Defaults to False.
         switching_point_coeffs (str, optional): Coefficients for switching point in beta distribution. Defaults to "alpha:6.0,beta:3.0".
         retain_model_name (str, optional): Name of the model to retain representations. Defaults to "meta-llama/Meta-Llama-3-8B-Instruct".
+        adversary_optimizers (str, optional): Adversary optimizer distribution, e.g. "adamw:0.5,sgd:0.5". Defaults to AdamW only.
+        adversary_warmup_steps (str, optional): Adversary warmup-step distribution, e.g. "0:0.33,10:0.33,30:0.33". Defaults to no warmup.
+        adversary_inner_loop_steps (str, optional): Adversary step-count distribution, e.g. "32:0.33,64:0.33,128:0.33". Defaults to tar_inner_loop_steps.
+        adversary_batch_sizes (str, optional): Per-GPU adversary batch-size distribution (multiples of tar_adversary_batch_size). Defaults to tar_adversary_batch_size * gradient_accumulation_steps.
+        tar_adversary_batch_size (int, optional): Micro-batch size of the adversary dataloaders. Defaults to 1.
+        adversary_sgd_lr_samples (str, optional): Learning rate samples used when the adversary optimizer is SGD. Defaults to adversary_lr_samples.
+        track_attack_displacement (bool, optional): Measure how far each layer/module moves during every attack; logs to wandb and <output_dir>/attack_displacement.csv. Defaults to False.
+        weight_perturb_scale (float, optional): Before each attack, add Gaussian noise N(0, (scale * rms(W))^2) to every weight tensor W; the attack starts from the perturbed weights and the clean weights are restored afterwards. 0 disables it. Defaults to 0.0.
+        output_dir (str, optional): Run output directory (for the displacement CSV).
         **kwargs: Additional keyword arguments.
 
     Returns:
@@ -953,6 +1057,11 @@ def tar_training_loop(
 
     model_storage = FSDPModelStorage()
     adversary_lr_samples = [float(lr) for lr in adversary_lr_samples.split(",")]
+    adversary_sgd_lr_samples = (
+        [float(lr) for lr in adversary_sgd_lr_samples.split(",")]
+        if adversary_sgd_lr_samples
+        else adversary_lr_samples
+    )
 
     # Setup model for representation-engineering retain loss
     retain_model = None
@@ -969,8 +1078,24 @@ def tar_training_loop(
     )
     model.zero_grad(set_to_none=False)
 
+    # Per-layer attack displacement tracking / weight perturbation (sharded params are accessible from here on)
+    shard_index, displacement_csv, perturb_generator = None, None, None
+    if track_attack_displacement or weight_perturb_scale > 0:
+        shard_index = ShardIndex(model)
+    if weight_perturb_scale > 0:
+        # Each rank owns different weights, so seed per rank to get independent noise
+        perturb_generator = torch.Generator(device=accelerator.device)
+        perturb_generator.manual_seed(1234 + accelerator.process_index)
+    if track_attack_displacement:
+        if accelerator.is_main_process:
+            os.makedirs(output_dir, exist_ok=True)
+            displacement_csv = open(os.path.join(output_dir, "attack_displacement.csv"), "w", newline="")
+            displacement_writer = csv.writer(displacement_csv)
+            displacement_writer.writerow(DISPLACEMENT_COLUMNS)
+            displacement_csv.flush()
+
     tamper_resistance_loss = 0
-    for _ in range(max_steps):
+    for outer_step in range(max_steps):
         tamper_resistance_loss = 0
         # Save params for tamper-resistance-optimizer step
         model_storage.collect_param_or_grad(
@@ -981,14 +1106,24 @@ def tar_training_loop(
         )
 
         optimizer.load_state_dict(move_to_device(optimizer.state_dict(), "cpu"))
-        for _ in range(tar_num_tasks_sampled):
+        for attack_idx in range(tar_num_tasks_sampled):
             sub_pbar = None
             adversary_type = distributed_sample_task(adversary_dist_types)
+            adversary_config = _sample_adversary_config(
+                adversary_optimizers,
+                adversary_warmup_steps,
+                adversary_inner_loop_steps,
+                adversary_batch_sizes,
+                tar_inner_loop_steps,
+                tar_adversary_batch_size,
+                gradient_accumulation_steps,
+            )
+            inner_loop_steps = adversary_config["inner_loop_steps"]
             if accelerator.is_main_process:
                 sub_pbar = tqdm(
                     colour="blue",
                     desc=f"Inner Training Loop ({adversary_type})",
-                    total=tar_inner_loop_steps,
+                    total=inner_loop_steps,
                     dynamic_ncols=True,
                 )
             adversary_lr_scheduler = distributed_sample_task(adversary_lr_schedulers)
@@ -1000,13 +1135,23 @@ def tar_training_loop(
                 gradient_accumulation_steps,
             )
 
-            # Sample adversary learning rate
+            # Sample adversary learning rate (SGD has its own list)
             adversary_lr = distributed_sample_adversary_lr(
-                adversary_lr_samples, accelerator
+                adversary_sgd_lr_samples
+                if adversary_config["optimizer"] == "sgd"
+                else adversary_lr_samples,
+                accelerator,
             )
 
             # Setup adversary optimizer
-            inner_optimizer = torch.optim.AdamW(model.parameters(), lr=adversary_lr)
+            if adversary_config["optimizer"] == "sgd":
+                inner_optimizer = torch.optim.SGD(
+                    model.parameters(), lr=adversary_lr, momentum=0.9
+                )
+            else:
+                inner_optimizer = torch.optim.AdamW(
+                    model.parameters(), lr=adversary_lr
+                )
             inner_optimizer = accelerator.prepare_optimizer(inner_optimizer)
             inner_scheduler = None
 
@@ -1014,19 +1159,54 @@ def tar_training_loop(
             if adversary_lr_scheduler == "linear_warmup":
                 inner_scheduler = torch.optim.lr_scheduler.LambdaLR(
                     inner_optimizer,
-                    lambda step: tar_inner_loop_steps / inner_optimizer_warmup_steps,
+                    lambda step: inner_loop_steps / inner_optimizer_warmup_steps,
                 )
                 inner_scheduler = accelerator.prepare(inner_scheduler)
+            elif adversary_lr_scheduler != "constant" or adversary_config["warmup_steps"]:
+                inner_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    inner_optimizer,
+                    _adversary_lr_lambda(
+                        adversary_lr_scheduler,
+                        adversary_config["warmup_steps"],
+                        inner_loop_steps,
+                    ),
+                )
+                inner_scheduler = accelerator.prepare(inner_scheduler)
+
+            accelerator.print(
+                f"Adversary: {adversary_type}, {adversary_config['optimizer']}, "
+                f"lr={adversary_lr}, scheduler={adversary_lr_scheduler}, "
+                f"warmup={adversary_config['warmup_steps']}, steps={inner_loop_steps}, "
+                f"per-GPU batch={adversary_config['batch_size']}"
+            )
+
+            # Random weight perturbation before the attack: the attack starts from theta + eps.
+            # The clean weights are restored from model_storage after the attack, as before.
+            perturbation = None
+            if weight_perturb_scale > 0:
+                perturbation, perturb_rel = perturb_weights(
+                    model, shard_index, weight_perturb_scale, perturb_generator
+                )
+                accelerator.print(f"Weight perturbation: rel {perturb_rel:.4f}")
+                if accelerator.is_main_process:
+                    wandb.log({"weight_perturb_rel": perturb_rel})
+            if accelerator.is_main_process:
+                wandb.log(
+                    {
+                        "adversary_lr": adversary_lr,
+                        "adversary_warmup_steps": adversary_config["warmup_steps"],
+                        "adversary_inner_loop_steps": inner_loop_steps,
+                        "adversary_batch_size": adversary_config["batch_size"],
+                    }
+                )
 
             # Sample switching point from beta distribution
             M = None
             if adversary_type == "retain_forget_switch":
-                M = _sample_switching_point(
-                    switching_point_coeffs, tar_inner_loop_steps
-                )
+                M = _sample_switching_point(switching_point_coeffs, inner_loop_steps)
                 accelerator.print(f"Switching at step: {M}")
 
-            for inner_step in range(tar_inner_loop_steps):
+            for inner_step in range(inner_loop_steps):
                 # Sample adversary batches
                 _adversary_type = adversary_type
                 if adversary_type == "retain_forget_switch":
@@ -1040,14 +1220,14 @@ def tar_training_loop(
                 ) = next_n_batches(
                     adversary_dataloaders[_adversary_type]["iter"],
                     adversary_dataloaders[_adversary_type]["dataloader"],
-                    gradient_accumulation_steps,
+                    adversary_config["accumulation_steps"],
                 )
 
                 # Per-step tamper-resistance loss weighting schedule
                 scheduled_weighting = (
-                    schedule(inner_step, tar_inner_loop_steps, schedule_lambda)
+                    schedule(inner_step, inner_loop_steps, schedule_lambda)
                     if use_weighting_schedule
-                    else 1 / tar_inner_loop_steps
+                    else 1 / inner_loop_steps
                 )
 
                 # Whether to compute TR grad for current step (sub-sampling trick from appendix)
@@ -1071,12 +1251,30 @@ def tar_training_loop(
                     sub_pbar=sub_pbar,
                     tamper_resistance_loss_type=tar_tamper_resistance_loss_type,
                     compute_tamper_resistance_grad=compute_tamper_resistance_grad,
+                    adversary_accumulation_steps=adversary_config["accumulation_steps"],
                 )
 
-            inner_optimizer.load_state_dict(
-                move_to_device(inner_optimizer.state_dict(), "cpu")
-            )
+            # Free the adversary optimizer state directly. The original
+            # load_state_dict(... "cpu") round trip casts the state back to the GPU
+            # (params' device), briefly doubling it, and caused OOM on 4 GPUs.
             delete_optimizer(inner_optimizer)
+            del inner_optimizer, inner_scheduler
+            torch.cuda.empty_cache()
+
+            # How far each layer/module moved during this attack (before params are restored)
+            if track_attack_displacement:
+                results = attack_displacement(model, model_storage, shard_index, perturbation)
+                if accelerator.is_main_process:
+                    for r in results:
+                        displacement_writer.writerow([
+                            outer_step, attack_idx, adversary_type, adversary_lr,
+                            adversary_lr_scheduler, adversary_config["warmup_steps"],
+                            r["block"], r["module"], r["numel"], r["l2_diff"], r["rel_diff"],
+                        ])
+                    displacement_csv.flush()
+                    wandb.log({
+                        f"attack_disp/{k}": v for k, v in per_block_summary(results).items()
+                    })
 
             model_storage.add_from_storage_to_model(
                 model=model,
@@ -1139,4 +1337,6 @@ def tar_training_loop(
                 }
             )
 
+    if displacement_csv is not None:
+        displacement_csv.close()
     return model

@@ -1,0 +1,33 @@
+accelerate launch --config_file $ExACCEL_CONFIG $ACCEL_LAUNCH_ARGS tar.py \
+--trainer_type tar_trainer \
+--max_steps 750 \
+--tar_num_tasks_sampled 1 \
+--tar_tamper_resistance_loss_type max_entropy \
+--tar_inner_loop_steps 64 \
+--retain_representations \
+--gradient_checkpointing \
+--unbounded \
+--use_weighting_schedule \
+--tar_tamper_resistance_grad_scale 4.0 \
+--tar_retain_scale 1.0 \
+--schedule_lambda 0.0625 \
+--warmup_steps 32 \
+--lr 2e-05 \
+--adversary_lr_samples 2e-6,1e-5,2e-5,3e-5,4e-5,6e-5,1e-4 \
+--batch_size 8 \
+--gradient_accumulation_steps 4 \
+--adversary_dist_types pile-bio:0.33,camel-bio:0.33,retain_forget_switch:0.33 \
+--switching_point_coeffs alpha:6.0,beta:3.0 \
+--adversary_lr_schedulers constant:0.34,linear:0.33,cosine:0.33 \
+--adversary_warmup_steps 0:0.5,10:0.5 \
+--inner_optimizer_warmup_steps 20 \
+--tar_inner_loop_subsample 4 \
+--tar_adversary_batch_size 4 \
+--base_model_name lapisrocks/Llama-3-8B-Instruct-Random-Mapped-Bio \
+--subject bio \
+--base llama3 \
+--new_model_name Llama-3-8B-Instruct-TAR-Bio-diverse_sft \
+--expname diverse_params_v1 \
+--wandb \
+--track_attack_displacement \
+"$@"
